@@ -3,10 +3,9 @@ import copy
 import sys
 import threading
 import time
-import pulsectl
 import serial
 from serial.tools import list_ports
-
+import platform
 
 class Mixer:
     """
@@ -36,7 +35,7 @@ class Mixer:
             self._port.close()
         while True:
             for i in serial.tools.list_ports.comports():
-                if i.subsystem == 'usb' and i.manufacturer[:7] == 'Arduino':
+                if i.manufacturer[:7] == 'Arduino':
                     self._port = serial.Serial(i.device)
                     time.sleep(2)
                     if self._port.read_all()[:14] == b'Hardware Mixer':
@@ -69,69 +68,140 @@ class Mixer:
         return copy.deepcopy(self._volumes)
 
 
-class PulseAudioConnection:
-    """
-    Manages the connection of a Mixer to the PulseAudio audio backend. After constructing an instance of this object,
-    call `listen` to begin changing application volumes.
-    """
+# Linux import:
+if platform.system() == "Linux":
+    import pulsectl
 
-    def __init__(self, mixer: Mixer):
+    class PulseAudioConnection:
         """
-        Starts a new thread to watch for mixer input changes. Handles all
-        :param mixer: Mixer to connect
+        Manages the connection of a Mixer to the PulseAudio audio backend. After constructing an instance of this object,
+        call `listen` to begin changing application volumes.
         """
-        self._mixer = mixer
-        self._pulse = pulsectl.Pulse("Hardware Mixer")
 
-        # Subscribe to volume change events
-        self._pulse.event_callback_set(lambda x: self._pulse.event_listen_stop())
-        self._pulse.event_mask_set(self._pulse.event_masks[9])
-        threading.Thread(target=self._mixer_listener).start()
+        def __init__(self, mixer: Mixer):
+            """
+            Starts a new thread to watch for mixer input changes. Handles all
+            :param mixer: Mixer to connect
+            """
+            self._mixer = mixer
+            self._pulse = pulsectl.Pulse("Hardware Mixer")
 
-    def __del__(self):
-        self._pulse.close()
-
-    def _mixer_listener(self):
-        """
-        Reads volumes from the mixer and then allows the volume set loop to continue.
-        :return: None
-        """
-        while True:
-            self._mixer.read_volumes()
-            self._pulse.event_listen_stop()
-
-    def listen(self):
-        """
-        Performs the volume set loop. This function never returns, and must be called from the main thread.
-        :return: None
-        """
-        while True:
-            # Get the mixer volumes
-            volumes = self._mixer.get_volumes()
-
-            self._pulse.event_mask_set(self._pulse.event_masks[8])
-
-            # Set the sink input volumes
-            for sink in self._pulse.sink_input_list():
-                app_name = sink.proplist.get('application.name')
-                if not app_name:
-                    continue
-
-                try:
-                    for i, channel_apps in enumerate(channels):
-                        if app_name in channel_apps:
-                            self._pulse.volume_set_all_chans(sink, volumes[i])
-                            break
-                    else:
-                        if any_controller is not False:
-                            self._pulse.volume_set_all_chans(sink, volumes[any_controller - 1])
-                except pulsectl.PulseOperationFailed:
-                    pass
-
+            # Subscribe to volume change events
+            self._pulse.event_callback_set(lambda x: self._pulse.event_listen_stop())
             self._pulse.event_mask_set(self._pulse.event_masks[9])
+            threading.Thread(target=self._mixer_listener).start()
 
-            self._pulse.event_listen()
+        def __del__(self):
+            self._pulse.close()
 
+        def _mixer_listener(self):
+            """
+            Reads volumes from the mixer and then allows the volume set loop to continue.
+            :return: None
+            """
+            while True:
+                self._mixer.read_volumes()
+                self._pulse.event_listen_stop()
+
+        def listen(self):
+            """
+            Performs the volume set loop. This function never returns, and must be called from the main thread.
+            :return: None
+            """
+            while True:
+                # Get the mixer volumes
+                volumes = self._mixer.get_volumes()
+
+                self._pulse.event_mask_set(self._pulse.event_masks[8])
+
+                # Set the sink input volumes
+                for sink in self._pulse.sink_input_list():
+                    app_name = sink.proplist.get('application.name')
+                    if not app_name:
+                        continue
+
+                    try:
+                        for i, channel_apps in enumerate(channels):
+                            if app_name in channel_apps:
+                                self._pulse.volume_set_all_chans(sink, volumes[i])
+                                break
+                        else:
+                            if any_controller is not False:
+                                self._pulse.volume_set_all_chans(sink, volumes[any_controller - 1])
+                    except pulsectl.PulseOperationFailed:
+                        pass
+
+                self._pulse.event_mask_set(self._pulse.event_masks[9])
+
+                self._pulse.event_listen()
+
+if platform.system() == "Darwin":
+    raise NotImplementedError("Hardware Mixer is not supported on macOS yet!")
+
+if platform.system() == "Windows":
+    import pycaw.pycaw as audio
+
+
+    class CoreAudioConnection:
+        """
+        Manages the connection of a Mixer to the Core Audio backend on Windows. After constructing an instance of this object,
+        call `listen` to begin changing application volumes.
+        """
+
+        def __init__(self, mixer):
+            """
+            Starts a new thread to watch for mixer input changes. Handles all
+            :param mixer: Mixer to connect
+            """
+            self._mixer = mixer
+            self._session_manager = audio.AudioSessionManager(audio.ProcessId.RunningUser)
+            self._volume_events = threading.Event()
+            threading.Thread(target=self._mixer_listener).start()
+
+        def __del__(self):
+            pass
+
+        def _mixer_listener(self):
+            """
+            Reads volumes from the mixer and then allows the volume set loop to continue.
+            :return: None
+            """
+            while True:
+                self._mixer.read_volumes()
+                self._volume_events.set()
+
+        def listen(self):
+            """
+            Performs the volume set loop. This function never returns, and must be called from the main thread.
+            :return: None
+            """
+            while True:
+                # Get the mixer volumes
+                volumes = self._mixer.get_volumes()
+
+                # Set the session volumes
+                sessions = self._session_manager.Sessions()
+                for session in sessions:
+                    try:
+                        app_name = session.Process.name()
+                        if not app_name:
+                            continue
+
+                        for i, channel_apps in enumerate(channels):
+                            if app_name in channel_apps:
+                                volume = session.SimpleAudioVolume
+                                volume.SetMasterVolume(volumes[i])
+                                break
+                        else:
+                            if any_controller is not False:
+                                volume = session.SimpleAudioVolume
+                                volume.SetMasterVolume(volumes[any_controller - 1])
+                    except (AttributeError, RuntimeError):
+                        pass
+
+                # Wait for the next volume change event
+                self._volume_events.wait()
+                self._volume_events.clear()
 
 if __name__ == "__main__":
     config = configparser.RawConfigParser()
